@@ -1,0 +1,14 @@
+# local install/run artifacts (machine-specific)
+_setup-result.txt
+audit.log
+*-log.txt
+
+# adversarial-review transcripts + scratch (kept local)
+_review-prompt.txt
+_codex-*.txt
+_grok-*.txt
+_grok-run*.log
+_grokreview*.ps1
+_diag*.txt
+_diag*.ps1
+_e2e*.txt
