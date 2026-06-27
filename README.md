@@ -33,7 +33,9 @@ the client reads plus a fail-closed audit line.
   UAC (editing the admin-only `broker-policy.json`).
 - **TOCTOU/reparse-safe** request reads (one exclusive `FILE_FLAG_OPEN_REPARSE_POINT` handle). **Fail-closed
   JSON-lines audit** attributed to the request file's OS-set owner (unforgeable). **Create-only** request
-  queue (a client can drop a request but cannot read, modify, or list it afterward).
+  queue: a client can drop a request but cannot list or read others'. (Its creator owns its own request and
+  could rewrite that file's DACL, but that is harmless — the attacker already controls the request JSON, and
+  safety comes from the exclusive no-reparse read plus the allow-list validation, not from the file ACL.)
 - Install-time integrity rests on invoking a trusted `setup-agentelevate.ps1` from a reviewed copy; the
   deployed bytes are SHA-256 pinned (a source swap mid-install is caught) and the trust anchor is verified
   fail-closed before any SYSTEM task is registered.

@@ -53,6 +53,11 @@ Describe 'Test-EnvDenied (machine-env hard denylist)' {
   It 'denies COMPLUS_ prefix' { Assert-True (Test-EnvDenied 'COMPLUS_ProfilerEnabled') }
   It 'denies DOTNET_ prefix' { Assert-True (Test-EnvDenied 'DOTNET_STARTUP_HOOKS') }
   It 'denies ComSpec' { Assert-True (Test-EnvDenied 'ComSpec') }
+  It 'denies JAVA_TOOL_OPTIONS (cross-runtime loader)' { Assert-True (Test-EnvDenied 'JAVA_TOOL_OPTIONS') }
+  It 'denies PYTHONPATH (cross-runtime loader)' { Assert-True (Test-EnvDenied 'PYTHONPATH') }
+  It 'denies NODE_OPTIONS (cross-runtime loader)' { Assert-True (Test-EnvDenied 'NODE_OPTIONS') }
+  It 'denies CLASSPATH' { Assert-True (Test-EnvDenied 'CLASSPATH') }
+  It 'denies LD_PRELOAD' { Assert-True (Test-EnvDenied 'LD_PRELOAD') }
   It 'allows a benign app var' { Assert-False (Test-EnvDenied 'MY_APP_HOME') }
 }
 

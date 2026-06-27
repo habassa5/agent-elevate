@@ -31,6 +31,7 @@ Describe 'Write-Audit -- log-injection resistance (CRLF in claimedBy)' {
   $tmp = Join-Path $env:TEMP ("rc_audit_inj_{0}.log" -f ([guid]::NewGuid().ToString('N')))
   try {
     $script:AUDIT = $tmp
+    New-Item -ItemType File -Path $tmp -Force | Out-Null   # setup creates audit.log admin-only; the broker only APPENDS (open-existing)
     # A malicious claimedBy: a CRLF followed by a fully-formed FORGED audit record. If Write-Audit wrote the
     # field raw, this would appear as an extra physical line that looks like a genuine ALLOW-OK success.
     $evil = "attacker`r`n{`"ts`":`"2099-01-01`",`"reqId`":`"x`",`"owner`":`"S-1-5-18`",`"claimedBy`":`"broker`",`"op`":`"winget-install`",`"verdict`":`"ALLOW-OK`",`"detail`":`"PWNED`"}"
@@ -75,13 +76,14 @@ Describe 'Write-Audit -- success contract' {
   $tmp = Join-Path $env:TEMP ("rc_audit_ok_{0}.log" -f ([guid]::NewGuid().ToString('N')))
   try {
     $script:AUDIT = $tmp
+    New-Item -ItemType File -Path $tmp -Force | Out-Null   # broker appends to the setup-created audit.log
     $ret = Write-Audit @{ ts='2026-01-01'; reqId='abc'; owner='S-1-5-18'; claimedBy='broker'; op='winget-install'; verdict='ALLOW-OK'; detail='ok' }
     $lines = @(Get-AuditLines $tmp)
 
     It 'returns $true on a successful durable write' {
       Assert-True ($ret -eq $true) 'Write-Audit must return $true when it durably wrote the line'
     }
-    It 'actually created the audit file with exactly one record' {
+    It 'appended exactly one record to the audit file' {
       Assert-True (Test-Path -LiteralPath $tmp) 'the audit file should exist after a successful write'
       Assert-Equal $lines.Count 1 'a single Write-Audit call should append exactly one line'
     }
@@ -141,5 +143,28 @@ Describe 'Write-Audit -- fail-closed on un-writable / illegal path' {
     # make Remove-Item throw a TERMINATING binding error that -ErrorAction SilentlyContinue does not catch.
     try { if ([System.IO.File]::Exists($illegalPath)) { Remove-Item -LiteralPath $illegalPath -Force -ErrorAction SilentlyContinue } } catch {}
     try { if ([System.IO.Directory]::Exists($badDir)) { Remove-Item -LiteralPath $badDir -Recurse -Force -ErrorAction SilentlyContinue } } catch {}
+  }
+}
+
+Describe 'Write-Audit -- open-existing-only: a missing audit.log fails closed and is NOT recreated (AUD-1)' {
+  # The broker must NEVER auto-create a missing audit.log: a recreated file would inherit the home dir's
+  # Users:RX and silently break the "Users have no audit.log access" invariant. setup creates it admin-only;
+  # the broker opens EXISTING-only. Here the parent EXISTS but the file does not.
+  $saved = $script:AUDIT
+  $tmpDir = Join-Path $env:TEMP ("rc_audit_missing_{0}" -f ([guid]::NewGuid().ToString('N')))
+  New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
+  $missing = Join-Path $tmpDir 'audit.log'
+  try {
+    $script:AUDIT = $missing
+    $ret = Write-Audit @{ ts='x'; reqId='r'; owner='o'; claimedBy='broker'; op='hosts-add'; verdict='DENY-POLICY'; detail='missing-audit' }
+    It 'returns $false when audit.log is absent (fail-closed)' {
+      Assert-True ($ret -eq $false) 'a missing audit.log must fail closed, not be silently recreated'
+    }
+    It 'does NOT create the missing audit file (no wrong-perms self-heal)' {
+      Assert-False ([System.IO.File]::Exists($missing)) 'Write-Audit must not create a missing audit.log'
+    }
+  } finally {
+    $script:AUDIT = $saved
+    Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
   }
 }
