@@ -17,9 +17,6 @@
 dialog — without a broad security downgrade. It is a standalone project (nothing to do with power/sleep/lock or
 keep‑awake); it only brokers elevated operations.
 
-**Keywords:** sudo for Windows · run as administrator without UAC prompt · gsudo alternative · PsExec‑style
-elevation · no‑UAC / silent elevation · unattended privilege broker · Claude Code / Codex CLI Windows admin.
-
 ## Why a custom broker? (vs gsudo, Windows `sudo`, PowerToys)
 
 UAC is a security boundary *by design*, so there is no general "make elevation never prompt." The existing
