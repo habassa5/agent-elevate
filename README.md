@@ -2,9 +2,7 @@
 
 ### Admin, without the ask.
 
-> **sudo for Windows, built for AI agents.** Your agent runs the admin tasks you approve — with **no UAC prompt**,
-> even **unattended**, surviving reboots. A **hardened, allow‑listed, audited** take on the "sudo for Windows" /
-> **gsudo** / **PsExec** pattern, for a **single‑user machine you own** (Claude Code, Codex CLI).
+> **sudo for Windows, built for AI agents.** Your agent runs the admin tasks you approve — with **no UAC prompt**, even **unattended**.
 
 > [!WARNING]
 > **Intended threat model: a single‑user, single‑admin Windows machine you personally own.** AgentElevate
