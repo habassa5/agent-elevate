@@ -1,12 +1,24 @@
-# AgentElevate
+# AgentElevate — sudo for Windows, for AI agents (no‑UAC elevation broker)
 
-A **no-UAC elevation broker** for Windows. It lets local AI coding agents (Claude Code, Codex CLI, etc.)
-perform a small, admin-curated set of elevated operations **as SYSTEM without a UAC prompt** — without a
-broad security downgrade. Built for a single-user, single-admin machine where the user runs agents
-autonomously and refuses to babysit UAC.
+> Run **admin / elevated operations on Windows without a UAC prompt** — **unattended** and **surviving reboots** —
+> from an AI coding agent (Claude Code, Codex CLI). A **hardened, allow‑listed, audited** take on the
+> "sudo for Windows" / **gsudo** / **PsExec** pattern, built for a **single‑user machine you own**.
 
-It is a standalone project: it has nothing to do with power/sleep/lock settings or Remote-Control keep-awake
-(that is a separate effort). AgentElevate only brokers elevated operations.
+> [!WARNING]
+> **Intended threat model: a single‑user, single‑admin Windows machine you personally own.** AgentElevate
+> deliberately lets a non‑admin process trigger a *curated, allow‑listed* set of `SYSTEM` operations without UAC.
+> **Do NOT use it on multi‑user, shared, domain‑joined, server, or enterprise machines** — there it is a local
+> privilege‑escalation surface, not a convenience. If you only need *interactive* elevation, use
+> [gsudo](https://github.com/gerardog/gsudo) or Windows 11's native `sudo` instead. Read
+> **[SECURITY.md](SECURITY.md)** before installing.
+
+**What it is:** a SYSTEM broker that runs a small, admin‑curated set of parameterized elevated operations
+(e.g. `winget install <allow‑listed id>`) with **no UAC prompt** — so an autonomous agent never stalls on a UAC
+dialog — without a broad security downgrade. It is a standalone project (nothing to do with power/sleep/lock or
+keep‑awake); it only brokers elevated operations.
+
+**Keywords:** sudo for Windows · run as administrator without UAC prompt · gsudo alternative · PsExec‑style
+elevation · no‑UAC / silent elevation · unattended privilege broker · Claude Code / Codex CLI Windows admin.
 
 ## Why a custom broker? (vs gsudo, Windows `sudo`, PowerToys)
 
