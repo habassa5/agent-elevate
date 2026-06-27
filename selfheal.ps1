@@ -14,8 +14,8 @@ function Test-ReparsePoint($p){ try { (((Get-Item -LiteralPath $p -Force).Attrib
 function _Untrusted($p){
   if(-not (Test-Path -LiteralPath $p)){ return 'missing' }
   if(Test-ReparsePoint $p){ return 'reparse' }
-  $acl = Get-Acl -LiteralPath $p; $o = $null
-  try { $o = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value } catch { return 'owner?' }
+  $acl = $null; try { $acl = Get-Acl -LiteralPath $p } catch { return 'acl-unreadable' }
+  $o = $null; try { $o = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value } catch { return 'owner?' }
   if(($o -ne 'S-1-5-32-544') -and ($o -ne 'S-1-5-18') -and ($o -notlike 'S-1-5-80-956008885*')){ return "owner $o" }
   $wm = [Security.AccessControl.FileSystemRights]'WriteData,AppendData,WriteAttributes,WriteExtendedAttributes,Delete,DeleteSubdirectoriesAndFiles,ChangePermissions,TakeOwnership'
   foreach($a in $acl.Access){
@@ -46,10 +46,35 @@ if($g -or $g2){
 # update/startup/daily -- restores them so the tamper-evident mirror never silently goes dark.
 foreach($s in @('AgentElevate','AgentElevate-Broker')){ try { if(-not [System.Diagnostics.EventLog]::SourceExists($s)){ [System.Diagnostics.EventLog]::CreateEventSource($s,'Application') } } catch {} }
 
-# Drift detection: a task is healthy iff present, enabled, with exactly one expected action (matched by the
-# -File TARGET path -- robust against Task Scheduler quote/space normalization of the arg string, which the
-# deployed space-containing path makes brittle for an exact-string compare) and a SYSTEM/Highest principal.
-function Test-TaskHealth([string]$name,[string]$file){
+# Exact command-line tokenizer (the Windows parser PowerShell itself uses). Lets drift detection compare the
+# action's ARG VECTOR token-for-token instead of substring/flag-presence (which would accept an injected -Command
+# or a '...broker.ps1.bak' look-alike). A dummy argv[0] is prepended so the real args parse with normal rules.
+if(-not ('AeArgv' -as [type])){
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class AeArgv {
+  [DllImport("shell32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+  static extern IntPtr CommandLineToArgvW(string cmd, out int n);
+  [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr h);
+  public static string[] Parse(string cmd) {
+    int n; IntPtr p = CommandLineToArgvW("ae " + cmd, out n);
+    if (p == IntPtr.Zero) return null;
+    try {
+      string[] r = new string[n > 0 ? n - 1 : 0];
+      for (int i = 1; i < n; i++) r[i-1] = Marshal.PtrToStringUni(Marshal.ReadIntPtr(p, i * IntPtr.Size));
+      return r;
+    } finally { LocalFree(p); }
+  }
+}
+"@
+}
+function ConvertTo-AeArgv($s){ try { return [AeArgv]::Parse([string]$s) } catch { return $null } }
+
+# Drift detection: a task is healthy iff present + enabled, with EXACTLY one action whose Execute + full arg
+# VECTOR (tokenized) match the expected, a SYSTEM/Highest principal, IgnoreNew, and the expected set of trigger
+# TYPES all enabled. $expTrig is the expected trigger array (Get-AE*Triggers) -- the same source registration uses.
+function Test-TaskHealth([string]$name,[string]$file,$expTrig){
   $t = Get-ScheduledTask -TaskName $name -EA SilentlyContinue
   if(-not $t){ return 'missing' }
   if($t.State -eq 'Disabled'){ return 'disabled' }
@@ -58,20 +83,34 @@ function Test-TaskHealth([string]$name,[string]$file){
   $act = $acts[0]
   $exp = Get-AEExpectedAction $file
   if($act.Execute -ne $exp.Execute){ return 'action-exe-drift' }
-  $expFile = Join-Path $AE_HOME $file
-  $args = [string]$act.Arguments
-  if($args -notlike "*$expFile*"){ return 'action-target-drift' }                  # the -File target must be our broker script
-  if($args -notmatch '(?i)-NoProfile' -or $args -notmatch '(?i)-ExecutionPolicy\s+Bypass'){ return 'action-flags-drift' }
+  # EXACT arg-vector match. Tokenizing normalizes Task Scheduler's quote/space re-formatting (so a healthy task
+  # matches) AND rejects an injected -Command, a missing flag, an unquoted space-path, or a '-File ...broker.ps1.bak'.
+  $expTok = ConvertTo-AeArgv $exp.Argument
+  $actTok = ConvertTo-AeArgv ([string]$act.Arguments)
+  if(($null -eq $expTok) -or ($null -eq $actTok)){ return 'action-arg-untokenizable' }
+  if(@($expTok).Count -ne @($actTok).Count){ return "action-arg-drift (count $(@($actTok).Count)!=$(@($expTok).Count))" }
+  for($i=0; $i -lt @($expTok).Count; $i++){ if($expTok[$i] -ne $actTok[$i]){ return "action-arg-drift (token $i)" } }   # -ne is case-insensitive (flags + Windows paths)
   $uid = [string]$t.Principal.UserId
   if(($uid -ne 'S-1-5-18') -and ($uid -notmatch '(?i)^(NT AUTHORITY\\)?SYSTEM$')){ return "principal-drift ($uid)" }
   if($t.Principal.RunLevel -ne 'Highest'){ return 'runlevel-drift' }
+  if(([string]$t.Settings.MultipleInstances) -ne 'IgnoreNew'){ return "multiinstance-drift ($($t.Settings.MultipleInstances))" }  # must stay IgnoreNew (single-instance)
+  # Triggers: compare the TYPE multiset to expected (catches count drift + a wrong-type trigger) and require every
+  # trigger ENABLED. We do NOT deep-compare event subscription XML / repetition values: Task Scheduler normalizes
+  # them -> false-drift thrash, and a same-type wrong-content trigger needs ADMIN to create (out of threat model).
+  $expTypes  = @($expTrig | ForEach-Object { [string]$_.CimClass.CimClassName } | Sort-Object)
+  $liveTrig  = @($t.Triggers)
+  $liveTypes = @($liveTrig | ForEach-Object { [string]$_.CimClass.CimClassName } | Sort-Object)
+  if(($expTypes -join '|') -ne ($liveTypes -join '|')){ return "trigger-drift (types [$($liveTypes -join ',')] != [$($expTypes -join ',')])" }
+  if(@($liveTrig | Where-Object { -not $_.Enabled }).Count -gt 0){ return 'trigger-disabled' }
   return ''
 }
 
 $repaired = @(); $errors = @()
-foreach($pair in @(@{n='AgentElevate-Broker'; f='broker.ps1'; reg={Register-BrokerTask}}, @{n='AgentElevate-SelfHeal'; f='selfheal.ps1'; reg={Register-SelfHealTask}})){
+# trig = the expected trigger array, from the SAME Get-AE*Triggers that Register-*Task registers (single source --
+# no hardcoded baseline to desync). Test-TaskHealth derives both the count and the expected trigger TYPES from it.
+foreach($pair in @(@{n='AgentElevate-Broker'; f='broker.ps1'; trig=@(Get-AEBrokerTriggers); reg={Register-BrokerTask}}, @{n='AgentElevate-SelfHeal'; f='selfheal.ps1'; trig=@(Get-AESelfHealTriggers); reg={Register-SelfHealTask}})){
   try {
-    $h = Test-TaskHealth $pair.n $pair.f
+    $h = Test-TaskHealth $pair.n $pair.f $pair.trig
     if($h){ & $pair.reg; if($pair.n -eq 'AgentElevate-Broker'){ Start-ScheduledTask -TaskName $pair.n -EA SilentlyContinue }; $repaired += ("{0} ({1} -> re-registered)" -f $pair.n,$h) }
   } catch { $errors += ("{0}: {1}" -f $pair.n,$_) }
 }

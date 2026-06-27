@@ -1,14 +1,14 @@
 # Unit tests for [AeReq]::ReadExclusive (broker.ps1) -- the ONE exclusive, reparse-safe handle the
 # broker uses to read every queued request. Loaded straight from broker.ps1 via _load-broker.ps1 (no copy),
-# so these exercise the REAL native read path. Also covers the broker's UTF-8 BOM decode (broker.ps1 lines
-# 268-270). All writes go to a per-test temp dir under $env:TEMP and are removed in finally; nothing on the
+# so these exercise the REAL native read path. Also covers the broker's UTF-8 BOM strip in the request-decode
+# path. All writes go to a per-test temp dir under $env:TEMP and are removed in finally; nothing on the
 # live system is touched.
 #
 # Engine notes proven empirically on this machine (both powershell.exe 5.1 and pwsh 7):
 #  * A directory and a junction (a *directory* reparse point) both fail at CreateFileW with ERROR_ACCESS_DENIED
 #    -- ReadExclusive opens with FILE_FLAG_OPEN_REPARSE_POINT but NOT FILE_FLAG_BACKUP_SEMANTICS, so a dir
-#    handle never opens; the rejection surfaces as a Win32 "Access is denied" *before* the line-53/54
-#    attribute checks. The security property still holds: the call THROWS and reads nothing (it never follows
+#    handle never opens; the rejection surfaces as a Win32 "Access is denied" *before* ReadExclusive's
+#    reparse/directory attribute checks. The security property still holds: the call THROWS and reads nothing (it never follows
 #    the junction to its target). The IOException("reparse point")/("directory") branches are a backstop for a
 #    *file* reparse point, which a medium-IL attacker cannot create without SeCreateSymbolicLinkPrivilege.
 #  * [Text.Encoding]::UTF8.GetString does NOT strip a leading BOM on either engine, so the broker's explicit
@@ -34,21 +34,25 @@ Describe '[AeReq]::ReadExclusive -- normal read returns exact bytes' {
     $p = Join-Path $tmp 'normal.bin'
     [IO.File]::WriteAllBytes($p, $expected)
 
-    $got = [AeReq]::ReadExclusive($p, 1MB)
+    $rd = [AeReq]::ReadExclusive($p, 1MB)
+    $got = $rd.Data
 
-    It 'returns a byte[]' { Assert-Equal $got.GetType().Name 'Byte[]' }
+    It 'returns an AeRead carrying Data + Owner' { Assert-Equal $rd.GetType().Name 'AeRead' }
+    It 'returns a byte[] in .Data' { Assert-Equal $got.GetType().Name 'Byte[]' }
     It 'returns the exact byte count' { Assert-Equal $got.Length $expected.Length 'length mismatch' }
     It 'returns byte-for-byte identical content' {
       $same = $true
       for ($i = 0; $i -lt $expected.Length; $i++) { if ($got[$i] -ne $expected[$i]) { $same = $false; break } }
       Assert-True $same ('byte mismatch; got=[{0}] expected=[{1}]' -f ($got -join ','), ($expected -join ','))
     }
+    # .Owner comes from the validated handle (GetSecurityInfo), not a path Get-Acl -> a real SID string, never '?'.
+    It 'returns a real owner SID from the handle (not "?")' { Assert-Match $rd.Owner '^S-1-5-' }
 
     # An empty file is a legitimate (if malformed-as-a-request) input: must read cleanly as zero bytes,
     # never trip "too large", and not hang the broker's read loop.
     $pe = Join-Path $tmp 'empty.bin'
     [IO.File]::WriteAllBytes($pe, ([byte[]]@()))
-    $gote = [AeReq]::ReadExclusive($pe, 1MB)
+    $gote = [AeReq]::ReadExclusive($pe, 1MB).Data
     It 'reads an empty file as zero bytes' { Assert-Equal $gote.Length 0 'empty file should be 0 bytes' }
   } finally { Remove-RcTmpDir $tmp }
 }
@@ -68,7 +72,7 @@ Describe '[AeReq]::ReadExclusive -- rejects a file larger than maxLen' {
 
     # Boundary: maxLen exactly == size must SUCCEED (the check is strictly `len > maxLen`), and return all bytes.
     $okAtBoundary = $null
-    Assert-NotThrows { $script:okAtBoundary = [AeReq]::ReadExclusive($p, 4096) } 'len == maxLen must be allowed'
+    Assert-NotThrows { $script:okAtBoundary = [AeReq]::ReadExclusive($p, 4096).Data } 'len == maxLen must be allowed'
     It 'allows size == maxLen (strict greater-than boundary) and returns all bytes' {
       Assert-Equal $script:okAtBoundary.Length 4096 'boundary read should return the full file'
     }
@@ -125,7 +129,28 @@ Describe '[AeReq]::ReadExclusive -- rejects a reparse point (junction)' {
   } finally { Remove-RcTmpDir $tmp }
 }
 
-Describe 'broker decode path tolerates a UTF-8 BOM (broker.ps1 lines 268-270)' {
+Describe '[AeReq]::ReadExclusive -- rejects a hard link (audit-owner-spoof defense)' {
+  $tmp = New-RcTmpDir
+  try {
+    # A hard link is NOT a reparse point and shares the TARGET's security descriptor, so a non-admin could
+    # hardlink a request to a trusted-owned file and forge the audit owner. ReadExclusive must reject links>1.
+    $target = Join-Path $tmp 'hl-target.bin'
+    [IO.File]::WriteAllBytes($target, [Text.Encoding]::UTF8.GetBytes('{"op":"x","by":"a"}'))
+    $link = Join-Path $tmp 'hl.req.json'
+    $made = $false
+    try { New-Item -ItemType HardLink -Path $link -Target $target -EA Stop | Out-Null; $made = $true } catch {}
+    It 'precondition: a hard link was created (so links==2)' { Assert-True $made 'could not create a hard link to test with' }
+    if ($made) {
+      $threw = $false; $msg = ''; $ret = 'SENTINEL'
+      try { $ret = [AeReq]::ReadExclusive($link, 1MB) } catch { $threw = $true; $msg = $_.Exception.Message }
+      It 'throws on a hard link (never reads it)' { Assert-True $threw 'a hard link must be rejected' }
+      It 'returns no value for a hard link' { Assert-Equal $ret 'SENTINEL' 'hard link read must not return a value' }
+      It 'rejection reason is "hard link"' { Assert-Match $msg 'hard link' }
+    }
+  } finally { Remove-RcTmpDir $tmp }
+}
+
+Describe 'broker decode path tolerates a UTF-8 BOM (the request-decode BOM strip)' {
   $tmp = New-RcTmpDir
   try {
     # Write a BOM-prefixed JSON request exactly as a BOM-emitting client would, then read the raw bytes back
@@ -137,7 +162,7 @@ Describe 'broker decode path tolerates a UTF-8 BOM (broker.ps1 lines 268-270)' {
     [IO.File]::WriteAllBytes($p, $bytes)
 
     # Read the bytes back through the real reader (and confirm it preserves the BOM bytes verbatim).
-    $raw = [AeReq]::ReadExclusive($p, 1MB)
+    $raw = [AeReq]::ReadExclusive($p, 1MB).Data
     It 'the file really begins with a UTF-8 BOM (EF BB BF)' {
       Assert-True (($raw.Length -ge 3) -and ($raw[0] -eq 0xEF) -and ($raw[1] -eq 0xBB) -and ($raw[2] -eq 0xBF)) 'missing BOM bytes'
     }

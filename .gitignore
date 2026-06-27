@@ -6,10 +6,11 @@ audit.log
 # adversarial-review transcripts + scratch (kept local)
 _review-prompt.txt
 _codex-*.txt
+_codex-*.log
 _grok-*.txt
 _grok-run*.log
 _grokreview*.ps1
 _diag*.txt
 _diag*.ps1
-_e2e*.txt
+_e2e*
 _setup-console.txt
