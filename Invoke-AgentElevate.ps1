@@ -42,9 +42,17 @@ $resFile = Join-Path $RES ($id + '.res.json')
 $deadline = (Get-Date).AddSeconds($TimeoutSec)
 while ((Get-Date) -lt $deadline) {
   if (Test-Path -LiteralPath $resFile) {
-    $result = Get-Content -LiteralPath $resFile -Raw | ConvertFrom-Json
-    if (-not $result.ok) { Write-Error "AgentElevate broker op '$Op' failed: $($result.detail)" }
-    return $result
+    # The broker writes the result with Set-Content (non-atomic: truncate -> write -> close). Tolerate the tiny
+    # window where we catch a half-written/empty file: a parse/IO failure or whitespace-only content means
+    # 'not ready yet' -> keep polling instead of throwing a confusing parse error.
+    try {
+      $raw = Get-Content -LiteralPath $resFile -Raw -ErrorAction Stop
+      if (-not [string]::IsNullOrWhiteSpace($raw)) {
+        $result = $raw | ConvertFrom-Json
+        if (-not $result.ok) { Write-Error "AgentElevate broker op '$Op' failed: $($result.detail)" }
+        return $result
+      }
+    } catch { }   # transient mid-write read -> fall through and re-poll
   }
   Start-Sleep -Milliseconds 500
 }

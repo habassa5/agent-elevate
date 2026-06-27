@@ -69,8 +69,7 @@ public static class AeReq {
 }
 
 # ----- admin-only verifier: returns '' if $path is non-reparse, owned by a trusted principal, and has
-#       NO write/modify/delete/own ACE for any non-trusted principal; else a human reason. (Proven logic
-#       ported from the live keep-awake installer.) -----
+#       NO write/modify/delete/own ACE for any non-trusted principal; else a human reason. -----
 function Test-ReparsePoint($p){ try { (((Get-Item -LiteralPath $p -Force).Attributes) -band [IO.FileAttributes]::ReparsePoint) -ne 0 } catch { $false } }
 function Get-Untrusted($p,$isDir){
   if(-not (Test-Path -LiteralPath $p)){ return 'missing' }
@@ -86,7 +85,10 @@ function Get-Untrusted($p,$isDir){
     $s = $null; try { $s = $a.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { $s = $null }
     if(-not $s){ $bad += 'UNRESOLVABLE'; continue }
     if(($allow -contains $s) -or ($s -like "$SID_TI_PFX*")){ continue }
-    if(([int]$a.FileSystemRights -band [int]$wm) -ne 0){ $bad += $a.IdentityReference.Value }
+    # include GENERIC_WRITE (0x40000000) + GENERIC_ALL (0x10000000): inherit-only ACEs on DIRECTORIES retain
+    # raw generic bits (Windows only maps generic->specific on files at store time), so the specific mask alone
+    # would miss a non-admin generic-write/all ACE on a directory.
+    if(([int]$a.FileSystemRights -band ([int]$wm -bor 0x40000000 -bor 0x10000000)) -ne 0){ $bad += $a.IdentityReference.Value }
   }
   return ($bad -join '; ')
 }
@@ -98,17 +100,21 @@ function Write-Audit($obj){
   $ok = $false
   try {
     $json = ($obj | ConvertTo-Json -Compress -Depth 8)
-    # FileStream with WriteThrough so a committed audit line survives a power loss, not just a process crash.
-    $fs = New-Object System.IO.FileStream($AUDIT,[IO.FileMode]::Append,[IO.FileAccess]::Write,[IO.FileShare]::Read,4096,[IO.FileOptions]::WriteThrough)
+    # Open the EXISTING audit.log only (FileMode.Open) + WriteThrough. If it is missing -> throw -> fail-closed;
+    # never silently re-create it with inherited Users:RX (setup creates it admin-only; startup aborts if gone).
+    $fs = New-Object System.IO.FileStream($AUDIT,[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::Read,4096,[IO.FileOptions]::WriteThrough)
     $sw = New-Object System.IO.StreamWriter($fs,(New-Object System.Text.UTF8Encoding($false)))
-    try { $sw.WriteLine($json); $sw.Flush() } finally { $sw.Dispose() }
+    try { [void]$fs.Seek(0,[IO.SeekOrigin]::End); $sw.WriteLine($json); $sw.Flush() } finally { $sw.Dispose() }
     $ok = $true
   } catch { $ok = $false }
   try {
     $v = [string]$obj.verdict
     $lvl = if($v -eq 'ALLOW-OK'){'Information'} elseif($v -like 'DENY*' -or $v -eq 'ALLOW-FAIL'){'Warning'} else {'Error'}
-    # native .NET API: portable across Windows PowerShell 5.1 + PowerShell 7 (no Write-EventLog dependency)
-    [System.Diagnostics.EventLog]::WriteEntry('AgentElevate-Broker',($obj | ConvertTo-Json -Compress -Depth 8),[System.Diagnostics.EventLogEntryType]$lvl,4100)
+    # native .NET API (portable PS 5.1 + 7). Mirror a BOUNDED, fixed-shape record (NOT the raw attacker JSON,
+    # whose oversized params could throw >32766 chars and silently suppress the tamper-evident mirror).
+    $mirror = @{ ts=$obj.ts; reqId=$obj.reqId; owner=$obj.owner; claimedBy=([string]$obj.claimedBy); op=([string]$obj.op); verdict=$v; detail=([string]$obj.detail) }
+    $mmsg = ($mirror | ConvertTo-Json -Compress -Depth 3); if($mmsg.Length -gt 30000){ $mmsg = $mmsg.Substring(0,30000) }
+    [System.Diagnostics.EventLog]::WriteEntry('AgentElevate-Broker',$mmsg,[System.Diagnostics.EventLogEntryType]$lvl,4100)
   } catch {}
   return $ok
 }
@@ -141,7 +147,8 @@ function Test-PrivateOrLoopback($ip){
 # it is admin-only before running it as SYSTEM.
 function Resolve-Winget {
   $cands = @(Resolve-Path "$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*__8wekyb3d8bbwe\winget.exe" -EA SilentlyContinue | ForEach-Object { $_.Path })
-  $wg = $cands | Sort-Object | Select-Object -Last 1
+  # pick the highest VERSION (parsed from the package folder), not a lexicographic path sort (1.9 vs 1.24)
+  $wg = $cands | Sort-Object @{ Expression = { $v=[version]'0.0'; if($_ -match 'Microsoft\.DesktopAppInstaller_(\d+(\.\d+){1,3})_'){ [void][version]::TryParse($matches[1],[ref]$v) }; $v } } | Select-Object -Last 1
   if(-not $wg){ return $null }
   if(Get-Untrusted $wg $false){ return $null }
   return $wg
@@ -151,10 +158,14 @@ function Resolve-Winget {
 # mistakenly allow-lists one.
 $ENV_DENY = @('Path','PSModulePath','ComSpec','PATHEXT','windir','SystemRoot','SystemDrive','ProgramData',
   'ProgramFiles','ProgramFiles(x86)','CommonProgramFiles','CommonProgramFiles(x86)','__PSLockdownPolicy',
-  'PSExecutionPolicyPreference','TEMP','TMP','OS','USERPROFILE','ALLUSERSPROFILE','APPDATA','LOCALAPPDATA','DriverData')
+  'PSExecutionPolicyPreference','TEMP','TMP','OS','USERPROFILE','ALLUSERSPROFILE','APPDATA','LOCALAPPDATA','DriverData',
+  # cross-runtime code-loaders: setting these machine-wide steers Java/.NET/Python/Node/Perl/Ruby/native loaders
+  'JAVA_TOOL_OPTIONS','_JAVA_OPTIONS','JAVA_OPTS','JDK_JAVA_OPTIONS','CLASSPATH','PYTHONPATH','PYTHONSTARTUP',
+  'PYTHONHOME','NODE_OPTIONS','NODE_PATH','PERL5LIB','PERL5OPT','RUBYOPT','RUBYLIB','GEM_PATH','LD_PRELOAD',
+  'LD_LIBRARY_PATH','GCONV_PATH')
 function Test-EnvDenied($name){
   if($ENV_DENY -contains $name){ return $true }                 # -contains is case-insensitive (env names are too)
-  if($name -match '^(COMPLUS_|DOTNET_|COR_|CORECLR_)'){ return $true }  # CLR profiler / JIT hijack prefixes
+  if($name -match '^(COMPLUS_|DOTNET_|COR_|CORECLR_|JAVA_|_JAVA|PYTHON|NODE_|PERL5|RUBY)'){ return $true }  # CLR/JVM/Python/Node/etc. loader prefixes
   return $false
 }
 
@@ -261,13 +272,41 @@ catch { Write-Audit @{ ts=(Get-Date -Format o); reqId='-'; owner='-'; claimedBy=
 $ops = $pol.operations
 function Get-OpNode($op){ if($ops -and $ops.PSObject.Properties[$op]){ return $ops.PSObject.Properties[$op].Value } else { return $null } }
 
+# Validate the policy schema once at load so an admin typo fails CLOSED here (audit + exit) instead of
+# coercing/throwing mid-operation AFTER an ALLOW-RUN audit line. Only ENABLED ops' allow-lists are checked.
+function Test-PolicyValid($opsObj){
+  if($null -eq $opsObj){ return 'no operations object' }
+  foreach($opName in $KNOWN_OPS){
+    $n = if($opsObj.PSObject.Properties[$opName]){ $opsObj.PSObject.Properties[$opName].Value } else { $null }
+    if($null -eq $n){ continue }
+    if($n.PSObject.Properties['enabled'] -and ($n.enabled -isnot [bool])){ return "$opName.enabled must be a JSON boolean" }
+    if(-not (($n.enabled -is [bool]) -and $n.enabled)){ continue }
+    switch($opName){
+      'winget-install'  { foreach($x in @($n.allowedPackages)){ if($x -isnot [string]){ return 'winget-install.allowedPackages must be strings' } } }
+      'hosts-add'       { foreach($x in @($n.allowedHosts)){ if($x -isnot [string]){ return 'hosts-add.allowedHosts must be strings' } } }
+      'set-machine-env' { foreach($x in @($n.allowedEnvVars)){ if($x -isnot [string]){ return 'set-machine-env.allowedEnvVars must be strings' } } }
+      'firewall-allow'  {
+        if($n.PSObject.Properties['maxRules'] -and ($n.maxRules -isnot [int]) -and ($n.maxRules -isnot [long])){ return 'firewall-allow.maxRules must be an integer' }
+        foreach($rule in @($n.allowedRules)){
+          if(-not (V-Port $rule.port)){ return 'firewall-allow.allowedRules has an invalid port' }
+          if($rule.protocol -notin @('TCP','UDP')){ return 'firewall-allow.allowedRules.protocol must be TCP/UDP' }
+          if($rule.direction -notin @('Inbound','Outbound')){ return 'firewall-allow.allowedRules.direction must be Inbound/Outbound' }
+        }
+      }
+    }
+  }
+  return ''
+}
+$polBad = Test-PolicyValid $ops
+if($polBad){ Write-Audit @{ ts=(Get-Date -Format o); reqId='-'; owner='-'; claimedBy='broker'; op='-'; verdict='ERROR'; detail="policy schema invalid: $polBad" } | Out-Null; exit 1 }
+
 # ----- process pending requests (oldest first, capped) -----
 $pending = Get-ChildItem -LiteralPath $REQ_DIR -Filter '*.req.json' -File -EA SilentlyContinue | Sort-Object CreationTimeUtc | Select-Object -First $MAX_PER_RUN
 foreach($f in $pending){
   $reqFile = $f.FullName
   $reqId = ($f.BaseName -replace '\.req$','')
   if($reqId -notmatch '^[A-Za-z0-9]{1,64}$'){ $reqId = [guid]::NewGuid().ToString('N') }   # malformed name -> fresh id (no result-path collision/traversal)
-  $owner = '?'; $who = '?'; $op = '?'; $deleteReq = $true
+  $owner = '?'; $who = '?'; $op = '?'; $deleteReq = $true; $auditOk = $true
   try {
     try { $owner = (Get-Acl -LiteralPath $reqFile).GetOwner([Security.Principal.SecurityIdentifier]).Value } catch { $owner = 'unknown' }
     $bytes = $null
@@ -286,24 +325,25 @@ foreach($f in $pending){
     $node = Get-OpNode $op
     $result = @{ok=$false; detail=''}
     if($op -notin $KNOWN_OPS){
-      $result.detail = 'unknown operation'; Write-Audit @{ ts=(Get-Date -Format o); reqId=$reqId; owner=$owner; claimedBy=$who; op=$op; verdict='DENY-UNKNOWN'; detail=$result.detail } | Out-Null
+      $result.detail = 'unknown operation'; $auditOk = Write-Audit @{ ts=(Get-Date -Format o); reqId=$reqId; owner=$owner; claimedBy=$who; op=$op; verdict='DENY-UNKNOWN'; detail=$result.detail }
     } elseif(-not $node -or -not (($node.enabled -is [bool]) -and $node.enabled)){
       # require an ACTUAL JSON boolean true -- a string like "false" (or "true") is truthy in PowerShell and
       # must NOT enable an op; this denies a typo'd/over-permissive policy rather than silently enabling it.
-      $result.detail = 'operation not enabled in policy'; Write-Audit @{ ts=(Get-Date -Format o); reqId=$reqId; owner=$owner; claimedBy=$who; op=$op; verdict='DENY-POLICY'; detail=$result.detail } | Out-Null
+      $result.detail = 'operation not enabled in policy'; $auditOk = Write-Audit @{ ts=(Get-Date -Format o); reqId=$reqId; owner=$owner; claimedBy=$who; op=$op; verdict='DENY-POLICY'; detail=$result.detail }
     } else {
       # FAIL-CLOSED: only run the op if the "about to run" audit line was durably written.
       $ran = Write-Audit @{ ts=(Get-Date -Format o); reqId=$reqId; owner=$owner; claimedBy=$who; op=$op; verdict='ALLOW-RUN'; params=$r.params }
       if(-not $ran){
-        $result.detail = 'audit write failed; operation denied (fail-closed)'
+        $auditOk = $false; $result.detail = 'audit write failed; operation denied (fail-closed)'
       } else {
         $result = Invoke-Op $op $r.params $node
-        Write-Audit @{ ts=(Get-Date -Format o); reqId=$reqId; owner=$owner; claimedBy=$who; op=$op; verdict=$(if($result.ok){'ALLOW-OK'}else{'ALLOW-FAIL'}); detail=$result.detail } | Out-Null
+        $auditOk = Write-Audit @{ ts=(Get-Date -Format o); reqId=$reqId; owner=$owner; claimedBy=$who; op=$op; verdict=$(if($result.ok){'ALLOW-OK'}else{'ALLOW-FAIL'}); detail=$result.detail }
       }
     }
     @{ id=$reqId; ok=[bool]$result.ok; detail=[string]$result.detail; ts=(Get-Date -Format o) } | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $RES_DIR ($reqId + '.res.json')) -Encoding utf8
+    if(-not $auditOk){ $deleteReq = $false }   # terminal verdict not durably audited (e.g. full disk) -> keep request for retry; stale-GC backstops
   } catch {
-    Write-Audit @{ ts=(Get-Date -Format o); reqId=$reqId; owner=$owner; claimedBy=$who; op=$op; verdict='ERROR'; detail="$_" } | Out-Null
+    if(-not (Write-Audit @{ ts=(Get-Date -Format o); reqId=$reqId; owner=$owner; claimedBy=$who; op=$op; verdict='ERROR'; detail="$_" })){ $deleteReq = $false }
     try { @{ id=$reqId; ok=$false; detail="broker error"; ts=(Get-Date -Format o) } | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $RES_DIR ($reqId + '.res.json')) -Encoding utf8 } catch {}
   } finally {
     if($deleteReq){ Remove-Item -LiteralPath $reqFile -Force -EA SilentlyContinue }

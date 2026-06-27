@@ -30,11 +30,11 @@ $BROKER_FILES = @('broker.ps1','broker-policy.json','AgentElevate-tasks.ps1','se
 # on BOTH the source (early) and the DEPLOYED admin-only copy (before registering tasks) -- so a swap of the
 # writable source between those points is caught. Empty = pin skipped (the owner/DACL verify is always-on).
 $PIN = @{
-  'broker.ps1' = '7DE7A9F39AAA817CFE0B2F9AEDA57117D4F9EFEB4B322544C87205309B10163B'
+  'broker.ps1' = '236409B871241EEA10068E4398B1C534881A057C0DA35364E2DEC11F4488A528'
   'broker-policy.json' = '232917403DC9B6190E8E0B321CCC6AEE3C8EEF1E89B577DBE11531B9B3CAE2CE'
   'AgentElevate-tasks.ps1' = '25BA75B95E2151F78C1D166F1BEF900168C2DD3CED5443D8F049AFC66355E459'
-  'selfheal.ps1' = 'BE4A1E025063D196EBED82ADF65B1A1F7CD3791761E047F26FAF303E7F040BDB'
-  'Invoke-AgentElevate.ps1' = '5C76BD0DB7525836D147E88502A9FB11542C9005AFC24EC54A74B1B50AFC28A4'
+  'selfheal.ps1' = '293758D0CF2595684F16061C0971EEA7A3B645601893CB7F26A2F4DD99EED069'
+  'Invoke-AgentElevate.ps1' = '631EE085A428AC0E70661DE597FFDB171F2A89D68032C6936A7E05517A255E85'
 }
 
 $SID_SYSTEM='S-1-5-18'; $SID_ADMINS='S-1-5-32-544'; $SID_USERS='S-1-5-32-545'; $SID_TI_PFX='S-1-5-80-956008885'; $SID_CREATOR='S-1-3-0'
@@ -53,10 +53,11 @@ function Get-Untrusted($p,$isDir){
     $s = $null; try { $s = $a.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { $s = $null }
     if(-not $s){ $bad += 'UNRESOLVABLE'; continue }
     if(($allow -contains $s) -or ($s -like "$SID_TI_PFX*")){ continue }
-    if(([int]$a.FileSystemRights -band [int]$wm) -ne 0){ $bad += $a.IdentityReference.Value }
+    if(([int]$a.FileSystemRights -band ([int]$wm -bor 0x40000000 -bor 0x10000000)) -ne 0){ $bad += $a.IdentityReference.Value }  # +GENERIC_WRITE/ALL (dir inherit-only)
   }
   return ($bad -join '; ')
 }
+function Test-OwnerTrusted($p){ try { $o=(Get-Acl -LiteralPath $p).GetOwner([Security.Principal.SecurityIdentifier]).Value; ($o -eq $SID_ADMINS) -or ($o -eq $SID_SYSTEM) -or ($o -like "$SID_TI_PFX*") } catch { $false } }
 # Queue dirs intentionally grant Users a create ACE, so Get-Untrusted can't be used; verify non-reparse +
 # trusted owner + NO Allow ACE for a SID outside {SYSTEM, Admins, TrustedInstaller, Users}.
 function Get-UnexpectedAce($dir){
@@ -86,17 +87,33 @@ foreach($f in $BROKER_FILES){
 }
 L "source files verified (reparse + $(if($PIN.Count){'hash-pin'}else{'no pin'}))"
 
-# --- 1. directories (reject pre-existing reparse points; verify resolved paths stay under roots) ---
+# --- 1. directories ---
+# SQUAT DEFENSE: C:\ProgramData lets non-admins create subdirectories, so an attacker can pre-create
+# C:\ProgramData\AgentElevate (owning it + planting a DENY-Administrators ACE) and make `icacls /setowner`
+# below FAIL -> setup aborts -> persistent install DoS. If the data root exists but is NOT admin-owned,
+# reclaim it (takeown bypasses the DENY via SeTakeOwnership) and remove the whole tree so the (re)creation
+# below yields a known-good admin-owned tree. (DoS defense; never an escalation -- the broker anchor + setup
+# verify both fail-closed on a foreign owner regardless.)
+if((Test-Path $DATA) -and -not (Test-ReparsePoint $DATA) -and -not (Test-OwnerTrusted $DATA)){
+  & "$env:SystemRoot\System32\takeown.exe" /F $DATA /A /R /D Y *> $null
+  Remove-Item -LiteralPath $DATA -Recurse -Force -EA SilentlyContinue
+  if(Test-Path $DATA){ throw "a non-admin pre-created $DATA and it could not be reclaimed -- delete it manually (elevated) and re-run" }
+}
 foreach($d in @($HOME_DIR,$DATA,$REQ,$RES,$ALLOWED)){
-  if((Test-Path $d) -and (Test-ReparsePoint $d)){ throw "refusing: $d exists as a reparse point" }
+  if((Test-Path $d) -and (Test-ReparsePoint $d)){ throw "refusing: $d exists as a reparse point -- delete it (elevated) and re-run" }
   if(-not (Test-Path $d)){ New-Item -ItemType Directory -Path $d -Force | Out-Null }
 }
 if((Resolve-Path $REQ).Path -notlike (Join-Path $DATA '*')){ throw "requests dir resolves outside $DATA" }
 if((Resolve-Path $RES).Path -notlike (Join-Path $DATA '*')){ throw "results dir resolves outside $DATA" }
-# clear any pre-existing children in the queue dirs (transient; defeats a pre-planted reparse/result child)
-Get-ChildItem -LiteralPath $REQ -Force -EA SilentlyContinue | Remove-Item -Force -Recurse -EA SilentlyContinue
-Get-ChildItem -LiteralPath $RES -Force -EA SilentlyContinue | Remove-Item -Force -Recurse -EA SilentlyContinue
-L "dirs ok (queue children cleared)"
+# clear pre-existing queue children REPARSE-SAFELY: abort on any reparse/dir child (a planted junction would be
+# FOLLOWED by a recursive delete and could wipe its target as admin); delete only plain files.
+foreach($qd in @($REQ,$RES)){
+  foreach($c in @(Get-ChildItem -LiteralPath $qd -Force -EA SilentlyContinue)){
+    if((($c.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or $c.PSIsContainer){ throw "refusing: pre-existing queue child '$($c.FullName)' is a reparse point or directory -- delete $DATA manually (elevated) and re-run" }
+    Remove-Item -LiteralPath $c.FullName -Force -EA SilentlyContinue
+  }
+}
+L "dirs ok (owner-verified; queue children cleared reparse-safely)"
 
 # --- 2. deploy code into the admin-only path (inherits C:\Program Files admin-only ACL on creation) ---
 foreach($f in $BROKER_FILES){ Copy-Item -LiteralPath (Join-Path $SRC $f) -Destination (Join-Path $HOME_DIR $f) -Force }
@@ -123,9 +140,11 @@ Icacls $DATA /inheritance:r /grant:r "*${SID_SYSTEM}:(OI)(CI)F" "*${SID_ADMINS}:
 Icacls $RES  /setowner "*$SID_ADMINS"
 Icacls $RES  /inheritance:r /grant:r "*${SID_SYSTEM}:(OI)(CI)F" "*${SID_ADMINS}:(OI)(CI)F" "*${SID_USERS}:(OI)(CI)RX"
 Icacls $REQ  /setowner "*$SID_ADMINS"
-# Users grant has NO (OI)(CI): create files in THIS folder only; no inherit to children, so a submitted
-# request gets only the inherited SYSTEM:F/Admins:F -- the client cannot reopen/modify/list it.
-Icacls $REQ  /inheritance:r /grant:r "*${SID_SYSTEM}:(OI)(CI)F" "*${SID_ADMINS}:(OI)(CI)F" "*${SID_USERS}:(WD,AD,REA,RA,RC,S,X)"
+# Users grant = WD only (create FILE), NO AD (create subdir/junction), NO (OI)(CI) inheritance: a dropped
+# request inherits only SYSTEM:F/Admins:F and cannot be LISTED/read by other non-admins. (Its creator owns it
+# and could rewrite its own DACL, but that is harmless -- the attacker already controls the request JSON, and
+# the broker reads each request through ONE exclusive no-reparse handle + validates against the allow-list.)
+Icacls $REQ  /inheritance:r /grant:r "*${SID_SYSTEM}:(OI)(CI)F" "*${SID_ADMINS}:(OI)(CI)F" "*${SID_USERS}:(WD,REA,RA,RC,S,X)"
 L "data queue acls set (requests = create-only)"
 
 # --- 5. verify the DEPLOYED (now admin-only) bytes against the pin -- catches a source swap mid-install ---
@@ -148,7 +167,8 @@ L "trust-anchor verified admin-only (owner + DACL + non-reparse)"
 
 # --- 7. event sources via the native .NET API (works in both Windows PowerShell 5.1 and PowerShell 7) ---
 foreach($s in @('AgentElevate','AgentElevate-Broker')){ try { if(-not [System.Diagnostics.EventLog]::SourceExists($s)){ [System.Diagnostics.EventLog]::CreateEventSource($s,'Application') } } catch { L "event source $s : $_" } }
-L "event sources ok"
+$missingSrc = @('AgentElevate','AgentElevate-Broker') | Where-Object { try { -not [System.Diagnostics.EventLog]::SourceExists($_) } catch { $true } }
+if($missingSrc){ L "WARNING: event source(s) NOT registered ($($missingSrc -join ', ')) -- broker will run POLL-ONLY (up to ~3-min latency); low-latency event trigger disabled. (selfheal will retry post-update.)" } else { L "event sources verified" }
 
 # --- 8. tasks (single source of truth in AgentElevate-tasks.ps1) ---
 . (Join-Path $HOME_DIR 'AgentElevate-tasks.ps1')

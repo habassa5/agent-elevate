@@ -23,7 +23,7 @@ function _Untrusted($p){
     $s = $null; try { $s = $a.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { $s = $null }
     if(-not $s){ return 'unresolvable ACE' }
     if(@('S-1-5-18','S-1-5-32-544') -contains $s -or $s -like 'S-1-5-80-956008885*'){ continue }
-    if(([int]$a.FileSystemRights -band [int]$wm) -ne 0){ return "writable by $s" }
+    if(([int]$a.FileSystemRights -band ([int]$wm -bor 0x40000000 -bor 0x10000000)) -ne 0){ return "writable by $s" }  # +GENERIC_WRITE/ALL (dir inherit-only)
   }
   return ''
 }
@@ -41,17 +41,29 @@ if($g -or $g2){
 }
 . $TASKS
 
-# Drift detection: a task is healthy iff present, enabled, with the expected action + a SYSTEM/Highest principal.
+# Ensure BOTH Application event sources exist. The broker's 4100 audit mirror (Write-Audit) does NOT self-
+# create its source; a Windows feature update can wipe registered sources, so selfheal -- which runs post-
+# update/startup/daily -- restores them so the tamper-evident mirror never silently goes dark.
+foreach($s in @('AgentElevate','AgentElevate-Broker')){ try { if(-not [System.Diagnostics.EventLog]::SourceExists($s)){ [System.Diagnostics.EventLog]::CreateEventSource($s,'Application') } } catch {} }
+
+# Drift detection: a task is healthy iff present, enabled, with exactly one expected action (matched by the
+# -File TARGET path -- robust against Task Scheduler quote/space normalization of the arg string, which the
+# deployed space-containing path makes brittle for an exact-string compare) and a SYSTEM/Highest principal.
 function Test-TaskHealth([string]$name,[string]$file){
   $t = Get-ScheduledTask -TaskName $name -EA SilentlyContinue
   if(-not $t){ return 'missing' }
   if($t.State -eq 'Disabled'){ return 'disabled' }
+  $acts = @($t.Actions)
+  if($acts.Count -ne 1){ return "action-count-drift ($($acts.Count))" }
+  $act = $acts[0]
   $exp = Get-AEExpectedAction $file
-  $act = $t.Actions | Select-Object -First 1
-  if($null -eq $act -or $act.Execute -ne $exp.Execute){ return 'action-exe-drift' }
-  if($act.Arguments -ne $exp.Argument){ return 'action-args-drift' }
-  $uid = ($t.Principal.UserId)
-  if(($uid -notmatch '(?i)system') -and ($uid -ne 'S-1-5-18')){ return "principal-drift ($uid)" }
+  if($act.Execute -ne $exp.Execute){ return 'action-exe-drift' }
+  $expFile = Join-Path $AE_HOME $file
+  $args = [string]$act.Arguments
+  if($args -notlike "*$expFile*"){ return 'action-target-drift' }                  # the -File target must be our broker script
+  if($args -notmatch '(?i)-NoProfile' -or $args -notmatch '(?i)-ExecutionPolicy\s+Bypass'){ return 'action-flags-drift' }
+  $uid = [string]$t.Principal.UserId
+  if(($uid -ne 'S-1-5-18') -and ($uid -notmatch '(?i)^(NT AUTHORITY\\)?SYSTEM$')){ return "principal-drift ($uid)" }
   if($t.Principal.RunLevel -ne 'Highest'){ return 'runlevel-drift' }
   return ''
 }
