@@ -18,10 +18,14 @@ $SRC      = 'C:\dev\agent-elevate'
 $HOME_DIR = 'C:\Program Files\AgentElevate'
 $DATA     = 'C:\ProgramData\AgentElevate'; $REQ = Join-Path $DATA 'requests'; $RES = Join-Path $DATA 'results'
 $ALLOWED  = Join-Path $HOME_DIR 'allowed'; $AUDIT = Join-Path $HOME_DIR 'audit.log'
-$ICACLS   = "$env:SystemRoot\System32\icacls.exe"
-$log      = Join-Path $SRC '_setup-result.txt'
-function L($m){ $line = ("{0}  {1}" -f (Get-Date -Format o), $m); $line | Out-File -FilePath $log -Append -Encoding utf8; Write-Host $line }
-"=== setup-agentelevate $(Get-Date -Format o) ===" | Set-Content $log -Encoding utf8
+$ICACLS   = (Join-Path ([Environment]::SystemDirectory) 'icacls.exe')   # API-resolved (GetSystemDirectoryW), not $env:SystemRoot -- a poisoned install env can't redirect to a fake icacls.exe
+# Log to the CONSOLE first. Only AFTER $HOME_DIR is created admin-only (section 3) do we ALSO append to
+# $HOME_DIR\setup-result.txt. We NEVER write the log into the user-writable source tree: on a symlink-capable
+# box, malware could pre-plant _setup-result.txt as a symlink and make this elevated process truncate/append
+# through it to a protected file.
+$script:LOGFILE = $null
+function L($m){ $line = ("{0}  {1}" -f (Get-Date -Format o), $m); Write-Host $line; if($script:LOGFILE){ try { $line | Out-File -FilePath $script:LOGFILE -Append -Encoding utf8 } catch {} } }
+L "=== setup-agentelevate $(Get-Date -Format o) ==="
 
 # Broker subsystem -- the complete deployed file set (no keep-awake/notify; that is a separate project).
 $BROKER_FILES = @('broker.ps1','broker-policy.json','AgentElevate-tasks.ps1','selfheal.ps1','Invoke-AgentElevate.ps1')
@@ -30,19 +34,27 @@ $BROKER_FILES = @('broker.ps1','broker-policy.json','AgentElevate-tasks.ps1','se
 # on BOTH the source (early) and the DEPLOYED admin-only copy (before registering tasks) -- so a swap of the
 # writable source between those points is caught. Empty = pin skipped (the owner/DACL verify is always-on).
 $PIN = @{
-  'broker.ps1' = '236409B871241EEA10068E4398B1C534881A057C0DA35364E2DEC11F4488A528'
+  'broker.ps1' = '27F2D79BE350B1FDB7D4B5B4A353EE27E46C83DDB68E335D62D5F79AAE9C0E72'
   'broker-policy.json' = '232917403DC9B6190E8E0B321CCC6AEE3C8EEF1E89B577DBE11531B9B3CAE2CE'
-  'AgentElevate-tasks.ps1' = '25BA75B95E2151F78C1D166F1BEF900168C2DD3CED5443D8F049AFC66355E459'
-  'selfheal.ps1' = '293758D0CF2595684F16061C0971EEA7A3B645601893CB7F26A2F4DD99EED069'
-  'Invoke-AgentElevate.ps1' = '631EE085A428AC0E70661DE597FFDB171F2A89D68032C6936A7E05517A255E85'
+  'AgentElevate-tasks.ps1' = '261C1DF1C321997CB4ED77E0201835448E3F23834141EE63CA86F9B6C881EB0B'
+  'selfheal.ps1' = '9DB8C9B6B6EA05FDF06C80BE541E340BBBDAD0CC16C3EB10B28350DAB3D57824'
+  'Invoke-AgentElevate.ps1' = 'A48BA269C658A932557CAA38D07B90F55F8190BDDF11DB67BB5B2C4122AEEB54'
 }
 
 $SID_SYSTEM='S-1-5-18'; $SID_ADMINS='S-1-5-32-544'; $SID_USERS='S-1-5-32-545'; $SID_TI_PFX='S-1-5-80-956008885'; $SID_CREATOR='S-1-3-0'
+# Expected Users-ACE rights masks for the queue dirs -- MUST match the icacls grants in section 4. The post-deploy
+# verify flags any Users ACE granting rights BEYOND these, so a future typo granting Users:F/Modify fails closed.
+$USERS_RX  = [int]([Security.AccessControl.FileSystemRights]'ReadAndExecute,Synchronize')  # DATA + RES  (0x1200A9)
+$USERS_REQ = [int]([Security.AccessControl.FileSystemRights]'CreateFiles,ReadExtendedAttributes,Traverse,ReadAttributes,ReadPermissions,Synchronize')  # requests create-only (0x1200AA)
+# Expected Users-ACE inheritance per dir: DATA/RES propagate Users:RX to children (OI)(CI); requests must NOT
+# (the WD create-grant is dir-only, so a dropped request file does not inherit Users-write).
+$INH_CICO  = [int]([Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit')   # DATA + RES
+$INH_NONE  = [int]([Security.AccessControl.InheritanceFlags]'None')                              # requests
 function Test-ReparsePoint($p){ try { (((Get-Item -LiteralPath $p -Force).Attributes) -band [IO.FileAttributes]::ReparsePoint) -ne 0 } catch { $false } }
 function Get-Untrusted($p,$isDir){
   if(-not (Test-Path -LiteralPath $p)){ return 'missing' }
   if(Test-ReparsePoint $p){ return 'reparse point' }
-  $acl = Get-Acl -LiteralPath $p
+  $acl = $null; try { $acl = Get-Acl -LiteralPath $p } catch { return 'acl-unreadable' }
   $o = $null; try { $o = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value } catch { return 'owner unresolved' }
   if(($o -ne $SID_ADMINS) -and ($o -ne $SID_SYSTEM) -and ($o -notlike "$SID_TI_PFX*")){ return "owner $o" }
   $wm = [Security.AccessControl.FileSystemRights]'WriteData,AppendData,WriteAttributes,WriteExtendedAttributes,Delete,DeleteSubdirectoriesAndFiles,ChangePermissions,TakeOwnership'
@@ -60,18 +72,44 @@ function Get-Untrusted($p,$isDir){
 function Test-OwnerTrusted($p){ try { $o=(Get-Acl -LiteralPath $p).GetOwner([Security.Principal.SecurityIdentifier]).Value; ($o -eq $SID_ADMINS) -or ($o -eq $SID_SYSTEM) -or ($o -like "$SID_TI_PFX*") } catch { $false } }
 # Queue dirs intentionally grant Users a create ACE, so Get-Untrusted can't be used; verify non-reparse +
 # trusted owner + NO Allow ACE for a SID outside {SYSTEM, Admins, TrustedInstaller, Users}.
-function Get-UnexpectedAce($dir){
+function Get-UnexpectedAce($dir,$usersMask,$usersInherit){
   if(Test-ReparsePoint $dir){ return 'reparse' }
-  $acl = Get-Acl -LiteralPath $dir
+  $acl = $null; try { $acl = Get-Acl -LiteralPath $dir } catch { return 'acl-unreadable' }
   $o = $null; try { $o = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value } catch { return 'owner unresolved' }
   if(($o -ne $SID_ADMINS) -and ($o -ne $SID_SYSTEM) -and ($o -notlike "$SID_TI_PFX*")){ return "owner $o" }
-  $okSids = @($SID_SYSTEM,$SID_ADMINS,$SID_USERS)
+  $usersSeen = $false; $usersRights = 0
   foreach($a in $acl.Access){
     if($a.AccessControlType -ne 'Allow'){ continue }
     $s = $null; try { $s = $a.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { $s = $null }
     if(-not $s){ return 'unresolvable ACE' }
-    if(($okSids -contains $s) -or ($s -like "$SID_TI_PFX*")){ continue }
+    if(@($SID_SYSTEM,$SID_ADMINS) -contains $s -or ($s -like "$SID_TI_PFX*")){ continue }     # trusted principals: full rights allowed
+    if($s -eq $SID_USERS){
+      $usersSeen = $true; $usersRights = $usersRights -bor [int]$a.FileSystemRights
+      # the Users ACE must carry EXACTLY the expected inheritance (e.g. requests = NO inherit, so a request FILE
+      # can't inherit Users-create); a drift to (OI)(CI) on requests would leak Users rights onto children.
+      if([int]$a.InheritanceFlags -ne [int]$usersInherit){ return ("Users ACE inheritance drift (got [$($a.InheritanceFlags)], expected [$usersInherit])") }
+      continue
+    }
     return "unexpected ACE for $s"
+  }
+  # require the Users ACE to EXIST with EXACTLY the expected aggregate rights (catches both excess like Users:F
+  # AND a missing right that would silently break the queue, e.g. requests missing CreateFiles).
+  if(-not $usersSeen){ return 'Users ACE missing' }
+  if($usersRights -ne [int]$usersMask){ return ("Users ACE rights not exact (got 0x{0:X}, expected 0x{1:X})" -f $usersRights,[int]$usersMask) }
+  return ''
+}
+# audit.log holds request params + owner SIDs -> must be SYSTEM/Admins-only, NOT even Users-readable. Get-Untrusted
+# permits a non-admin READ ACE; this stricter check returns '' iff no Allow ACE exists for any SID outside the
+# trusted set. (Mirror of broker.ps1 Test-AuditTight, used on $AUDIT in the post-deploy verify.)
+function Test-AuditTight($p){
+  $u = Get-Untrusted $p $false; if($u){ return $u }
+  $acl = $null; try { $acl = Get-Acl -LiteralPath $p } catch { return 'acl-unreadable' }
+  foreach($a in $acl.Access){
+    if($a.AccessControlType -ne 'Allow'){ continue }
+    $s = $null; try { $s = $a.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { $s = $null }
+    if(-not $s){ return 'unresolvable ACE' }
+    if(@($SID_SYSTEM,$SID_ADMINS) -contains $s -or ($s -like "$SID_TI_PFX*")){ continue }
+    return "non-admin ACE on audit.log ($($a.IdentityReference.Value))"
   }
   return ''
 }
@@ -83,21 +121,22 @@ foreach($f in $BROKER_FILES){
   $sp = Join-Path $SRC $f
   if(-not (Test-Path -LiteralPath $sp -PathType Leaf)){ throw "source missing: $sp" }
   if(Test-ReparsePoint $sp){ throw "source is a reparse point (refusing to deploy): $sp" }
-  if($PIN.ContainsKey($f) -and ((Hash $sp) -ne $PIN[$f])){ throw "SOURCE hash mismatch for $f -- refusing to deploy a possibly-tampered payload" }
+  if($PIN.ContainsKey($f) -and $PIN[$f] -and ((Hash $sp) -ne $PIN[$f])){ throw "SOURCE hash mismatch for $f -- refusing to deploy a possibly-tampered payload" }   # $PIN[$f] non-empty: an empty pin SKIPS (per the comment above)
 }
 L "source files verified (reparse + $(if($PIN.Count){'hash-pin'}else{'no pin'}))"
 
 # --- 1. directories ---
 # SQUAT DEFENSE: C:\ProgramData lets non-admins create subdirectories, so an attacker can pre-create
-# C:\ProgramData\AgentElevate (owning it + planting a DENY-Administrators ACE) and make `icacls /setowner`
-# below FAIL -> setup aborts -> persistent install DoS. If the data root exists but is NOT admin-owned,
-# reclaim it (takeown bypasses the DENY via SeTakeOwnership) and remove the whole tree so the (re)creation
-# below yields a known-good admin-owned tree. (DoS defense; never an escalation -- the broker anchor + setup
-# verify both fail-closed on a foreign owner regardless.)
-if((Test-Path $DATA) -and -not (Test-ReparsePoint $DATA) -and -not (Test-OwnerTrusted $DATA)){
-  & "$env:SystemRoot\System32\takeown.exe" /F $DATA /A /R /D Y *> $null
-  Remove-Item -LiteralPath $DATA -Recurse -Force -EA SilentlyContinue
-  if(Test-Path $DATA){ throw "a non-admin pre-created $DATA and it could not be reclaimed -- delete it manually (elevated) and re-run" }
+# C:\ProgramData\AgentElevate (owning it) before setup runs. If the data root already exists but is NOT
+# admin-owned, we do NOT auto-reclaim it: a recursive takeown/delete could FOLLOW a planted junction child and
+# take/delete its target as admin. Instead we ABORT with reparse-safe `cmd /c rd /s` cleanup guidance (below).
+# (DoS defense; never an escalation -- the broker anchor + setup verify both fail-closed on a foreign owner.)
+if((Test-Path $DATA) -and -not (Test-OwnerTrusted $DATA)){
+  # A non-admin squatted the data root (C:\ProgramData lets Users mkdir). Do NOT auto-reclaim: a recursive
+  # takeown/delete would FOLLOW a planted junction child and could take/delete its target as admin. Abort and
+  # have the admin remove it DELIBERATELY + reparse-safely (cmd's `rd /s` removes a junction as a link, never
+  # recursing into its target). A one-time manual cleanup is the safe trade for not auto-walking attacker dirs.
+  throw "a non-admin pre-created $DATA (squat). From an elevated prompt, inspect it, then remove it reparse-safely and re-run setup:  cmd /c rd /s /q `"$DATA`""
 }
 foreach($d in @($HOME_DIR,$DATA,$REQ,$RES,$ALLOWED)){
   if((Test-Path $d) -and (Test-ReparsePoint $d)){ throw "refusing: $d exists as a reparse point -- delete it (elevated) and re-run" }
@@ -110,8 +149,11 @@ if((Resolve-Path $RES).Path -notlike (Join-Path $DATA '*')){ throw "results dir 
 foreach($qd in @($REQ,$RES)){
   foreach($c in @(Get-ChildItem -LiteralPath $qd -Force -EA SilentlyContinue)){
     if((($c.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or $c.PSIsContainer){ throw "refusing: pre-existing queue child '$($c.FullName)' is a reparse point or directory -- delete $DATA manually (elevated) and re-run" }
-    Remove-Item -LiteralPath $c.FullName -Force -EA SilentlyContinue
+    # -EA Stop + abort: a pre-existing plain file we CANNOT remove (lock or hostile ACL) must NOT be left behind
+    # while we register SYSTEM tasks over a dirty queue. Fail loudly so the admin clears it deliberately.
+    try { Remove-Item -LiteralPath $c.FullName -Force -EA Stop } catch { throw "could not remove pre-existing queue child '$($c.FullName)' ($_) -- a lock or ACL is blocking it; clear $DATA manually (elevated) and re-run" }
   }
+  if(@(Get-ChildItem -LiteralPath $qd -Force -EA SilentlyContinue).Count -ne 0){ throw "queue dir '$qd' not empty after cleanup -- clear $DATA manually (elevated) and re-run" }
 }
 L "dirs ok (owner-verified; queue children cleared reparse-safely)"
 
@@ -133,6 +175,10 @@ Icacls $ALLOWED /inheritance:r /grant:r "*${SID_SYSTEM}:(OI)(CI)F" "*${SID_ADMIN
 Icacls $AUDIT /setowner "*$SID_ADMINS"
 Icacls $AUDIT /inheritance:r /grant:r "*${SID_SYSTEM}:F" "*${SID_ADMINS}:F"
 L "ownership + acls set on code/allowed/audit"
+# $HOME_DIR is now admin-only (owner=Admins, Users:RX) -> safe to persist the setup log there (admin-only write,
+# attacker cannot pre-plant a symlink). Earlier lines were console-only (see the L() note above).
+$script:LOGFILE = Join-Path $HOME_DIR 'setup-result.txt'
+L "log now persisting to $script:LOGFILE"
 
 # --- 4. data queue ACLs. requests = CREATE-ONLY for Users; results = Users:RX; data root = traverse+read ---
 Icacls $DATA /setowner "*$SID_ADMINS"
@@ -150,7 +196,7 @@ L "data queue acls set (requests = create-only)"
 # --- 5. verify the DEPLOYED (now admin-only) bytes against the pin -- catches a source swap mid-install ---
 if($PIN.Count){
   foreach($f in $BROKER_FILES){
-    if($PIN.ContainsKey($f) -and ((Hash (Join-Path $HOME_DIR $f)) -ne $PIN[$f])){ throw "DEPLOYED hash mismatch for $f -- aborting before task registration (source may have been swapped mid-install)" }
+    if($PIN.ContainsKey($f) -and $PIN[$f] -and ((Hash (Join-Path $HOME_DIR $f)) -ne $PIN[$f])){ throw "DEPLOYED hash mismatch for $f -- aborting before task registration (source may have been swapped mid-install)" }   # empty pin SKIPS
   }
   L "deployed bytes hash-verified against pin"
 }
@@ -160,8 +206,8 @@ $bad = @()
 $u = Get-Untrusted $HOME_DIR $true; if($u){ $bad += "$HOME_DIR ($u)" }
 foreach($f in $BROKER_FILES){ $u = Get-Untrusted (Join-Path $HOME_DIR $f) $false; if($u){ $bad += "$f ($u)" } }
 $u = Get-Untrusted $ALLOWED $true; if($u){ $bad += "allowed ($u)" }
-$u = Get-Untrusted $AUDIT $false; if($u){ $bad += "audit.log ($u)" }
-foreach($d in @($DATA,$REQ,$RES)){ $u = Get-UnexpectedAce $d; if($u){ $bad += "$d ($u)" } }
+$u = Test-AuditTight $AUDIT; if($u){ $bad += "audit.log ($u)" }   # stricter: audit.log must be Users-NONE (no read)
+foreach($pair in @(@{d=$DATA;m=$USERS_RX;i=$INH_CICO}, @{d=$REQ;m=$USERS_REQ;i=$INH_NONE}, @{d=$RES;m=$USERS_RX;i=$INH_CICO})){ $u = Get-UnexpectedAce $pair.d $pair.m $pair.i; if($u){ $bad += "$($pair.d) ($u)" } }
 if($bad.Count -gt 0){ L ("VERIFY FAILED: " + ($bad -join ' | ')); throw "post-deploy trust-anchor verification FAILED -- SYSTEM tasks NOT registered. If a queue dir shows an 'unexpected ACE', delete C:\ProgramData\AgentElevate and re-run. Fix: $($bad -join ' | ')" }
 L "trust-anchor verified admin-only (owner + DACL + non-reparse)"
 

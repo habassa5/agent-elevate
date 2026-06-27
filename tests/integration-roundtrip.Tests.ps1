@@ -93,6 +93,25 @@ Describe 'Integration: deployed AgentElevate broker -- DENY round-trips (no syst
     # attempt would itself throw -- the absence of that right is part of the confinement.)
   }
 
+  It '(e) AGENT cross-process invocation (powershell -File ... -ParamsJson) works -- no hashtable-boundary error' {
+    if (Skip-IfNoBroker) { return }
+    # This is how an AGENT actually calls the broker: spawn a fresh powershell.exe with -File and pass params as
+    # a string. A [hashtable] cannot cross a -File arg boundary (it stringifies), and a raw JSON string's quotes
+    # can be mangled by PS 5.1 native-arg quoting -- so the robust form is -ParamsB64 (base64 of the JSON, no
+    # quotes to mangle). Off-allow-list id -> deny, nothing installed. Asserts the call binds cleanly and denies.
+    $pwshExe = (Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe')
+    $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes('{"id":"Bogus.NotAllowedPackage"}'))
+    # Child scope with Continue: the helper Write-Errors on a deny, and PS 5.1 promotes that native-command stderr
+    # to a TERMINATING error under the suite's ErrorActionPreference=Stop -- which would abort before the asserts.
+    $out = & {
+      $ErrorActionPreference = 'Continue'
+      & $pwshExe -NoProfile -ExecutionPolicy Bypass -File $RC_HELPER -Op winget-install -ParamsB64 $b64 2>&1 | Out-String
+    }
+    Assert-True  ($out -notmatch '(?i)cannot convert.*hashtable') "cross-process call must NOT hit the hashtable-boundary error; got: $out"
+    Assert-True  ($out -notmatch '(?i)invalid -Params') "cross-process -ParamsB64 must parse cleanly; got: $out"
+    Assert-Match $out 'not on allowedPackages' "the cross-process deny should report the allow-list reason; got: $out"
+  }
+
   It '(d) a request produces a AgentElevate-Broker EventID 4100 audit event in the Application log' {
     if (Skip-IfNoBroker) { return }
     # Mark a baseline, fire one fresh deny, then look for a 4100 at/after the baseline. Using a marker time

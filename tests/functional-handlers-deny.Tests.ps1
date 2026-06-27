@@ -1,137 +1,107 @@
-# Functional tests for the broker OPERATION HANDLERS -- DENY / validation branches ONLY. These exercise the
-# REAL Op-* functions (loaded from broker.ps1 via _load-broker.ps1, no copies) but ONLY along paths that
-# return ok=$false BEFORE any system mutation. They deliberately do NOT cover any allow path: no winget runs,
-# no script executes, the hosts file / machine env / firewall are never touched. Every fake policy node is
-# built the way the broker really sees it -- a PSCustomObject from ConvertFrom-Json -- so the array-vs-string
-# and empty-list semantics under test are the genuine ones (and match PS 5.1 + 7).
+# Functional tests for the broker's PARAM/ALLOW-LIST GATE (Test-OpParams) + request-shape gate (Test-RequestShape)
+# -- the deny/validation paths. Loaded from broker.ps1 via _load-broker.ps1 (no copies), so these exercise the
+# REAL validation. Test-OpParams is PURE (no side effects), so every case here is safe: nothing installs, no
+# script runs, the hosts file / machine env / firewall are never touched. Each fake policy node is built the way
+# the broker really sees it -- a PSCustomObject from ConvertFrom-Json -- so the array-vs-string + empty-list
+# semantics under test are the genuine ones (PS 5.1 + 7).
 . (Join-Path $PSScriptRoot '_load-broker.ps1')
 
 # A policy node exactly as ConvertFrom-Json yields it (matches Get-OpNode's return type at runtime).
 function New-Node([string]$json) { $json | ConvertFrom-Json }
 
-Describe 'Op-WingetInstall :: deny branches (never runs winget)' {
-  # An empty-allow-list node: even a charset-VALID id must be refused because it is not on allowedPackages,
-  # and the refusal happens BEFORE Resolve-Winget, so winget is never invoked.
-  $emptyNode = New-Node '{ "enabled": true, "allowedPackages": [] }'
-  $otherNode = New-Node '{ "enabled": true, "allowedPackages": ["Some.OtherPackage"] }'
-
-  It 'rejects an invalid package id (charset) -> ok=$false / invalid package id' {
-    $r = Op-WingetInstall @{ id = 'evil; rm -rf' } $emptyNode
-    Assert-False $r.ok 'space/semicolon id must be denied'
-    Assert-Match ([string]$r.detail) 'invalid package id'
+# Test-RequestShape takes the raw TEXT + the parsed object (the text check rejects a top-level array on BOTH
+# engines, since PS7's ConvertFrom-Json enumerates a top-level array before $r is formed). Helper mirrors the
+# broker's call: parse, then validate.
+function Shape([string]$json){ Test-RequestShape $json ($json | ConvertFrom-Json) }
+Describe 'Test-RequestShape :: rejects malformed JSON request shapes (array-vs-string type confusion)' {
+  It 'accepts a well-formed request object' {
+    Assert-Equal (Shape '{ "op":"winget-install", "by":"agent", "params": { "id":"Git.Git" } }') '' 'a valid request object must pass'
   }
-  It 'rejects a leading-dash id (flag injection) -> ok=$false / invalid package id' {
-    $r = Op-WingetInstall @{ id = '--source' } $otherNode
-    Assert-False $r.ok '--source must be denied as an invalid id'
-    Assert-Match ([string]$r.detail) 'invalid package id'
+  It 'rejects a top-level ARRAY of requests (engine-independent, text-level)' {
+    Assert-Match (Shape '[ { "op":"winget-install" } ]') 'array' 'a [{...}] request must be rejected on PS 5.1 AND 7'
   }
-  It 'rejects a non-string id (array type-confusion) -> ok=$false / invalid package id' {
-    $r = Op-WingetInstall @{ id = @('Microsoft.PowerShell','x') } $otherNode
-    Assert-False $r.ok 'array id must be denied'
-    Assert-Match ([string]$r.detail) 'invalid package id'
+  It 'rejects a non-string op (singleton-array unwrap)' {
+    Assert-Match (Shape '{ "op":["winget-install"], "params":{} }') 'op must be a string'
   }
-  It 'a charset-valid id NOT on an empty allowedPackages -> ok=$false / not on allowedPackages' {
-    $r = Op-WingetInstall @{ id = 'Microsoft.PowerShell' } $emptyNode
-    Assert-False $r.ok 'empty allow-list must deny every id'
-    Assert-Match ([string]$r.detail) 'not on allowedPackages'
-    Assert-Match ([string]$r.detail) 'Microsoft\.PowerShell'   # the offending id is echoed
+  It 'rejects a missing op' {
+    Assert-Match (Shape '{ "params":{} }') 'op must be a string'
   }
-  It 'a charset-valid id NOT on a non-empty (other) allowedPackages -> ok=$false / not on allowedPackages' {
-    $r = Op-WingetInstall @{ id = 'Microsoft.PowerShell' } $otherNode
-    Assert-False $r.ok 'id absent from the list must be denied'
-    Assert-Match ([string]$r.detail) 'not on allowedPackages'
+  It 'rejects a non-object params (array)' {
+    Assert-Match (Shape '{ "op":"winget-install", "params":[ { "id":"Git.Git" } ] }') 'params must be a JSON object'
+  }
+  It 'rejects a non-string by' {
+    Assert-Match (Shape '{ "op":"winget-install", "by":123, "params":{} }') 'by must be a string'
   }
 }
 
-Describe 'Op-RunAllowedScript :: deny branches (never executes a script)' {
-  It 'rejects a non-.ps1 name -> ok=$false / invalid script name' {
-    $r = Op-RunAllowedScript @{ name = 'evil.txt' }
-    Assert-False $r.ok
-    Assert-Match ([string]$r.detail) 'invalid script name'
+Describe 'Test-OpParams winget-install :: deny branches (pure; never runs winget)' {
+  $emptyNode = New-Node '{ "enabled": true, "allowedPackages": [] }'
+  $otherNode = New-Node '{ "enabled": true, "allowedPackages": ["Some.OtherPackage"] }'
+
+  It 'rejects an invalid package id (charset)' {
+    Assert-Match (Test-OpParams 'winget-install' @{ id = 'evil; rm -rf' } $emptyNode) 'invalid package id'
   }
-  It 'rejects path traversal in the name -> ok=$false / invalid script name' {
-    $r = Op-RunAllowedScript @{ name = '..\evil.ps1' }
-    Assert-False $r.ok '.. must never reach the filesystem'
-    Assert-Match ([string]$r.detail) 'invalid script name'
+  It 'rejects a leading-dash id (flag injection)' {
+    Assert-Match (Test-OpParams 'winget-install' @{ id = '--source' } $otherNode) 'invalid package id'
   }
-  It 'rejects reserved DOS device CON.ps1 -> ok=$false / invalid script name' {
-    $r = Op-RunAllowedScript @{ name = 'CON.ps1' }
-    Assert-False $r.ok 'CON.ps1 (reserved device) must be denied'
-    Assert-Match ([string]$r.detail) 'invalid script name'
+  It 'rejects a non-string id (array type-confusion)' {
+    Assert-Match (Test-OpParams 'winget-install' @{ id = @('Microsoft.PowerShell','x') } $otherNode) 'invalid package id'
   }
-  It 'a valid name absent from allowed\ is denied (deployed: not an approved script; not deployed: allowed dir not admin-only)' {
-    # V-ScriptName passes, so execution reaches the allowed\ checks. Either way the op DENIES (the security
-    # property): if AgentElevate is deployed the admin-only dir exists and the absent leaf is refused; if not
-    # deployed the dir is missing and the admin-only-dir gate refuses first. Random name stays absent.
+  It 'a charset-valid id NOT on an empty allowedPackages -> not on allowedPackages (echoes the id)' {
+    $d = Test-OpParams 'winget-install' @{ id = 'Microsoft.PowerShell' } $emptyNode
+    Assert-Match $d 'not on allowedPackages'
+    Assert-Match $d 'Microsoft\.PowerShell'
+  }
+  It 'a charset-valid id NOT on a non-empty (other) allowedPackages -> not on allowedPackages' {
+    Assert-Match (Test-OpParams 'winget-install' @{ id = 'Microsoft.PowerShell' } $otherNode) 'not on allowedPackages'
+  }
+  It 'an id ON the allow-list PASSES the param gate (returns empty -> would proceed to execute)' {
+    Assert-Equal (Test-OpParams 'winget-install' @{ id = 'Some.OtherPackage' } $otherNode) '' 'an allow-listed id must pass the gate'
+  }
+}
+
+Describe 'run-allowed-script :: deny branches (never executes a script)' {
+  # Invalid NAMES are rejected by the pure param gate (Test-OpParams).
+  It 'Test-OpParams rejects a non-.ps1 name' { Assert-Match (Test-OpParams 'run-allowed-script' @{ name = 'evil.txt' } $null) 'invalid script name' }
+  It 'Test-OpParams rejects path traversal in the name' { Assert-Match (Test-OpParams 'run-allowed-script' @{ name = '..\evil.ps1' } $null) 'invalid script name' }
+  It 'Test-OpParams rejects reserved DOS device CON.ps1' { Assert-Match (Test-OpParams 'run-allowed-script' @{ name = 'CON.ps1' } $null) 'invalid script name' }
+  # A charset-valid but ABSENT name passes the param gate, then Op-RunAllowedScript denies it as an execution
+  # precondition (the leaf doesn't exist / the allowed dir gate) -- safe to call: it returns BEFORE executing.
+  It 'Op-RunAllowedScript denies a valid-but-absent name before executing' {
     $name = ('rc_test_{0}.ps1' -f ([guid]::NewGuid().ToString('N')))
+    Assert-Equal (Test-OpParams 'run-allowed-script' @{ name = $name } $null) '' 'a valid name passes the param gate'
     $r = Op-RunAllowedScript @{ name = $name }
     Assert-False $r.ok 'a name not present in allowed\ must be denied'
     Assert-Match ([string]$r.detail) '(not an approved script|allowed dir not admin-only)'
   }
 }
 
-Describe 'Op-HostsAdd :: deny branches (never edits the hosts file)' {
+Describe 'Test-OpParams hosts-add :: deny branches (pure; never edits the hosts file)' {
   $emptyNode = New-Node '{ "enabled": true, "allowedHosts": [] }'
   $okHostNode = New-Node '{ "enabled": true, "allowedHosts": ["app.internal.test"] }'
 
-  It 'rejects an invalid IP -> ok=$false / invalid ip/host' {
-    $r = Op-HostsAdd @{ ip = '999.1.1.1'; host = 'app.internal.test' } $okHostNode
-    Assert-False $r.ok '999.x is not a valid octet'
-    Assert-Match ([string]$r.detail) 'invalid ip/host'
-  }
-  It 'rejects a host NOT on allowedHosts -> ok=$false / not on allowedHosts' {
-    $r = Op-HostsAdd @{ ip = '10.1.2.3'; host = 'evil.example.com' } $emptyNode
-    Assert-False $r.ok 'host absent from allowedHosts must be denied'
-    Assert-Match ([string]$r.detail) 'not on allowedHosts'
-  }
-  It 'an ALLOWED host with a link-local 169.254 IP -> ok=$false / link-local.*refused' {
-    # The metadata-service style 169.254 address must be refused even though the host is approved.
-    $r = Op-HostsAdd @{ ip = '169.254.169.254'; host = 'app.internal.test' } $okHostNode
-    Assert-False $r.ok 'link-local must be refused'
-    Assert-Match ([string]$r.detail) 'loopback or RFC1918'
-  }
-  It 'an ALLOWED host with a PUBLIC 8.8.8.8 IP -> ok=$false / link-local.*refused' {
-    $r = Op-HostsAdd @{ ip = '8.8.8.8'; host = 'app.internal.test' } $okHostNode
-    Assert-False $r.ok 'a public IP must be refused (no DNS hijack to the internet)'
-    Assert-Match ([string]$r.detail) 'loopback or RFC1918'
-  }
+  It 'rejects an invalid IP' { Assert-Match (Test-OpParams 'hosts-add' @{ ip = '999.1.1.1'; host = 'app.internal.test' } $okHostNode) 'invalid ip/host' }
+  It 'rejects a host NOT on allowedHosts' { Assert-Match (Test-OpParams 'hosts-add' @{ ip = '10.1.2.3'; host = 'evil.example.com' } $emptyNode) 'not on allowedHosts' }
+  It 'an ALLOWED host with a link-local 169.254 IP is refused' { Assert-Match (Test-OpParams 'hosts-add' @{ ip = '169.254.169.254'; host = 'app.internal.test' } $okHostNode) 'loopback or RFC1918' }
+  It 'an ALLOWED host with a PUBLIC 8.8.8.8 IP is refused' { Assert-Match (Test-OpParams 'hosts-add' @{ ip = '8.8.8.8'; host = 'app.internal.test' } $okHostNode) 'loopback or RFC1918' }
 }
 
-Describe 'Op-SetMachineEnv :: deny branches (never sets a machine env var)' {
-  # 'Path' is intentionally placed ON the allow-list to prove the hard denylist still wins.
-  $pathAllowedNode = New-Node '{ "enabled": true, "allowedEnvVars": ["Path"] }'
+Describe 'Test-OpParams set-machine-env :: deny branches (pure; never sets a machine env var)' {
+  $pathAllowedNode = New-Node '{ "enabled": true, "allowedEnvVars": ["Path"] }'   # Path ON the list proves the hard denylist still wins
   $emptyNode       = New-Node '{ "enabled": true, "allowedEnvVars": [] }'
 
-  It 'denies Path even when it is allow-listed -> ok=$false / hard-denied' {
-    $r = Op-SetMachineEnv @{ name = 'Path'; value = 'C:\evil' } $pathAllowedNode
-    Assert-False $r.ok 'Path must be hard-denied regardless of the allow-list'
-    Assert-Match ([string]$r.detail) 'hard-denied'
-  }
-  It 'denies a name NOT on allowedEnvVars -> ok=$false / not on allowedEnvVars' {
-    $r = Op-SetMachineEnv @{ name = 'MY_APP_HOME'; value = 'C:\app' } $emptyNode
-    Assert-False $r.ok 'a benign name absent from the list must be denied'
-    Assert-Match ([string]$r.detail) 'not on allowedEnvVars'
-  }
-  It 'rejects a non-string value (type-confusion) -> ok=$false / invalid env name/value' {
-    $r = Op-SetMachineEnv @{ name = 'MY_APP_HOME'; value = @('a','b') } $emptyNode
-    Assert-False $r.ok 'an array value must be denied'
-    Assert-Match ([string]$r.detail) 'invalid env name/value'
-  }
+  It 'denies Path even when it is allow-listed (hard denylist wins)' { Assert-Match (Test-OpParams 'set-machine-env' @{ name = 'Path'; value = 'C:\evil' } $pathAllowedNode) 'hard-denied' }
+  It 'denies a name NOT on allowedEnvVars' { Assert-Match (Test-OpParams 'set-machine-env' @{ name = 'MY_APP_HOME'; value = 'C:\app' } $emptyNode) 'not on allowedEnvVars' }
+  It 'rejects a non-string value (type-confusion)' { Assert-Match (Test-OpParams 'set-machine-env' @{ name = 'MY_APP_HOME'; value = @('a','b') } $emptyNode) 'invalid env name/value' }
 }
 
-Describe 'Op-FirewallAllow :: deny branches (never creates a rule)' {
+Describe 'Test-OpParams firewall-allow :: deny branches (pure; never creates a rule)' {
   $emptyNode = New-Node '{ "enabled": true, "allowedRules": [], "maxRules": 20 }'
 
-  It 'rejects invalid firewall params (bad protocol) -> ok=$false / invalid firewall params' {
-    $r = Op-FirewallAllow @{ port = 443; protocol = 'ICMP'; direction = 'Outbound' } $emptyNode
-    Assert-False $r.ok 'ICMP is not an accepted protocol'
-    Assert-Match ([string]$r.detail) 'invalid firewall params'
-  }
-  It 'a well-formed rule NOT on allowedRules -> ok=$false / not on allowedRules' {
-    # Valid port/proto/direction, but the empty allow-list means it must be denied BEFORE any rule is made.
-    $r = Op-FirewallAllow @{ port = 443; protocol = 'TCP'; direction = 'Inbound' } $emptyNode
-    Assert-False $r.ok 'no rule may be created from an empty allowedRules'
-    Assert-Match ([string]$r.detail) 'not on allowedRules'
-    Assert-Match ([string]$r.detail) 'Inbound/TCP/443'   # the refused rule is echoed back
+  It 'rejects invalid firewall params (bad protocol)' { Assert-Match (Test-OpParams 'firewall-allow' @{ port = 443; protocol = 'ICMP'; direction = 'Outbound' } $emptyNode) 'invalid firewall params' }
+  It 'a well-formed rule NOT on allowedRules is denied (echoes the rule)' {
+    $d = Test-OpParams 'firewall-allow' @{ port = 443; protocol = 'TCP'; direction = 'Inbound' } $emptyNode
+    Assert-Match $d 'not on allowedRules'
+    Assert-Match $d 'Inbound/TCP/443'
   }
 }

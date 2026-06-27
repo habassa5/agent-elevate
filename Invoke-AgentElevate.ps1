@@ -8,8 +8,13 @@
   This client grants no privilege by itself: an op (or a parameter value) that is not allow-listed comes
   back ok=$false, never a silent escalation.
 .EXAMPLE
-  Invoke-AgentElevate -Op winget-install -Params @{ id = 'Git.Git' }      # id must be on allowedPackages
-  Invoke-AgentElevate -Op run-allowed-script -Params @{ name = 'reset-iis.ps1' }   # script must be in the admin-only allowed\ dir
+  # AGENT / cross-process (a spawned powershell.exe) -- pass params as base64 of the params JSON (-ParamsB64);
+  # robust across every shell + PS 5.1/7 (no quotes to mangle). A [hashtable] cannot survive a -File boundary.
+  #   bash:  B64=$(printf '%s' '{"id":"Git.Git"}' | base64 -w0)
+  powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\AgentElevate\Invoke-AgentElevate.ps1" -Op winget-install -ParamsB64 $B64
+.EXAMPLE
+  # In-process (already inside a PowerShell session) -- a hashtable is fine:
+  & "C:\Program Files\AgentElevate\Invoke-AgentElevate.ps1" -Op run-allowed-script -Params @{ name = 'reset-iis.ps1' }
 .NOTES
   Ships ENABLED: winget-install{id}, run-allowed-script{name}. Ships DISABLED (enable + curate with one UAC):
   hosts-add{ip,host}, firewall-allow{direction,protocol,port}, set-machine-env{name,value}. Service control
@@ -20,6 +25,14 @@
 param(
   [Parameter(Mandatory)][string]$Op,
   [hashtable]$Params = @{},
+  # Cross-process callers (an AGENT spawning `powershell.exe -File Invoke-AgentElevate.ps1 ...`) cannot pass a
+  # [hashtable] (it stringifies across a -File boundary). Two string forms:
+  #  -ParamsB64  = base64 of the params JSON  -> MOST ROBUST: no embedded quotes, so it survives ANY shell and
+  #                both Windows PowerShell 5.1 and 7 native-argument quoting. Recommended for agents.
+  #  -ParamsJson = the params JSON string directly -> readable; works from bash/cmd and PowerShell 7, but PS 5.1's
+  #                `&` native-arg quoting can strip the inner quotes, so prefer -ParamsB64 when in doubt.
+  [string]$ParamsJson,
+  [string]$ParamsB64,
   [int]$TimeoutSec = 300
 )
 $DATA = 'C:\ProgramData\AgentElevate'; $REQ = Join-Path $DATA 'requests'; $RES = Join-Path $DATA 'results'
@@ -31,7 +44,15 @@ $who = "$env:USERNAME@$env:COMPUTERNAME pid=$PID"
 # NOTE: this variable is $body, NOT $req -- PowerShell variable names are CASE-INSENSITIVE, so a $req
 # here would be the SAME variable as $REQ (the requests path) and would clobber it, sending the request
 # to a bogus path. Keep request-body and path variable names distinct.
-$body = @{ op = $Op; params = $Params; by = $who; ts = (Get-Date -Format o) } | ConvertTo-Json -Compress -Depth 6
+# params source precedence: -ParamsB64 (most robust cross-process), then -ParamsJson (cross-process), then
+# -Params (in-process hashtable). ConvertTo-Json below serializes a hashtable or the parsed PSCustomObject the same.
+$paramsForBody =
+  if($PSBoundParameters.ContainsKey('ParamsB64') -and $ParamsB64){
+    try { ([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($ParamsB64))) | ConvertFrom-Json } catch { throw "invalid -ParamsB64 (base64 of a JSON object): $_" }
+  } elseif($PSBoundParameters.ContainsKey('ParamsJson') -and $ParamsJson){
+    try { $ParamsJson | ConvertFrom-Json } catch { throw "invalid -ParamsJson (a JSON object like '{""id"":""Git.Git""}'): $_" }
+  } else { $Params }
+$body = @{ op = $Op; params = $paramsForBody; by = $who; ts = (Get-Date -Format o) } | ConvertTo-Json -Compress -Depth 6
 # Single direct write (no temp+rename: the queue is create-only, so the client has no delete right). The
 # broker reads each request through ONE exclusive handle, so it only ever sees a fully-written file.
 $final = Join-Path $REQ ($id + '.req.json')
