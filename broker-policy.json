@@ -1,0 +1,30 @@
+{
+  "version": 2,
+  "_comment": "AgentElevate broker allow-list. ADMIN-ONLY file (owner Administrators, Users:RX). The broker runs ONLY operations whose node has enabled=true, and within each op ONLY values present on that op's admin-curated allow-list. Editing this file requires admin rights (one UAC) -- that single UAC is the deliberate gate for adding any new capability. A char-valid value that is NOT on the allow-list is rejected. Scope = 'Moderate' (minus service control, which was dropped after adversarial review found brokering service-restart-as-SYSTEM too deep a surface to bound safely -- restart a service manually with one UAC when needed). package installs + approved scripts ship ENABLED; hosts/firewall/env ship DISABLED with empty lists (turn each on + curate its list with one UAC when you actually need it).",
+  "_howto": "winget-install: add exact winget package ids to allowedPackages (note: an approved package still runs its vendor installer as SYSTEM -- only list ids you trust at that level). run-allowed-script: drop the .ps1 into 'C:\\Program Files\\AgentElevate\\allowed\\' (admin-only) -- presence there IS the allow-list. hosts-add: enabled=true + exact hostnames in allowedHosts (IPs are restricted to loopback/RFC1918 in code; link-local and public are refused). firewall-allow: enabled=true + add exact {port,protocol,direction} objects to allowedRules (the attacker cannot choose the direction -- only rules you pre-approve are creatable; prefer Outbound, and only approve an Inbound rule when you intend that port to be reachable). set-machine-env: enabled=true + exact var names in allowedEnvVars (dangerous names like Path/PSModulePath/COMPLUS_*/__PSLockdownPolicy are hard-denied in code regardless).",
+  "operations": {
+    "winget-install": {
+      "enabled": true,
+      "allowedPackages": [
+        "Microsoft.PowerShell",
+        "Git.Git"
+      ]
+    },
+    "run-allowed-script": {
+      "enabled": true
+    },
+    "hosts-add": {
+      "enabled": false,
+      "allowedHosts": []
+    },
+    "firewall-allow": {
+      "enabled": false,
+      "allowedRules": [],
+      "maxRules": 20
+    },
+    "set-machine-env": {
+      "enabled": false,
+      "allowedEnvVars": []
+    }
+  }
+}
