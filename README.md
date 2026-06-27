@@ -144,6 +144,10 @@ the Windows Application event log, source `AgentElevate-Broker`), attributed to 
 allow-list — never executed) · `DENY-UNDELETABLE` (request couldn't be removed, so not run, to prevent replay) ·
 `DENY-READ` (unreadable/locked request) · `GC-STALE` (reaped) · `ERROR` / `ABORT-ANCHOR` (broker fault/tamper).
 
+## Built with
+
+Authored and maintained by [Salim Habash](https://github.com/habassa5). Built with [Claude Code](https://claude.com/claude-code) and the Codex CLI.
+
 ## License
 
 [MIT](LICENSE) © 2026 Salim Habash. Security-sensitive software provided "as is" — review the source and
