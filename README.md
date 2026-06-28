@@ -50,7 +50,7 @@ allow-list (`broker-policy.json`), runs only allow-listed, parameterized operati
 client reads plus a fail-closed audit line.
 
 An agent spawns a fresh `powershell.exe`, so it passes params as a string (a hashtable cannot cross a
-`-File` boundary). Prefer `-ParamsB64`, base64 of the params JSON. It carries no quotes for a
+`-File` boundary). The robust form is `-ParamsB64`, base64 of the params JSON. It carries no quotes for a
 shell or Windows PowerShell 5.1 to mangle:
 
 ```bash
