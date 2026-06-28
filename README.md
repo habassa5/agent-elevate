@@ -105,6 +105,8 @@ one-off elevated command).
 Accepted residual: an allow-listed winget package still runs its vendor installer as SYSTEM — inherent to
 "install packages without UAC". Only list package ids you trust at that level.
 
+**What not to broker.** The operations that would trigger the most UACs (registry writes to `HKLM`, ACL changes via `icacls`, scheduled-task registration, service control) are exactly the ones to keep *off* the broker as general parameterized ops. As a no-UAC `SYSTEM` operation, each is a keys-to-the-kingdom primitive: one `icacls` grant, one `HKLM\...\Run` value, or one SYSTEM scheduled task is enough for a caller to escalate arbitrarily. The UAC prompt on those IS the boundary you want. When a *specific* admin task recurs and you want it prompt-free, write a fixed, parameter-free `.ps1`, review it, and drop it in `allowed\` (the `run-allowed-script` op). That brokers the exact operation without handing the caller the general primitive.
+
 ## Install
 
 ```powershell
